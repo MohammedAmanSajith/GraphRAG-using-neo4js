@@ -1,0 +1,8 @@
+langchain
+langchain-google-genai
+langchain-neo4j
+langchain-experimental
+langchain-community
+neo4j
+python-dotenv
+pypdf
