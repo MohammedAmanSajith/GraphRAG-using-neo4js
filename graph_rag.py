@@ -8,6 +8,7 @@ from langchain_core.documents import Document
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pathlib import Path
+from tqdm import tqdm
 
 load_dotenv()
 
@@ -65,27 +66,25 @@ def load_and_chunk_pdfs():
         print(f"No PDF files found in {PDF_FOLDER}/ folder")
         return []
     
-    print(f"Found {len(pdf_files)} PDF file(s)")
+    print(f"Found {len(pdf_files)} PDF file(s)\n")
     
     all_documents = []
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
+        chunk_size=2000,
+        chunk_overlap=300,
         length_function=len,
         separators=["\n\n", "\n", " ", ""]
     )
     
-    for pdf_file in pdf_files:
-        print(f"Loading: {pdf_file.name}")
+    for pdf_file in tqdm(pdf_files, desc="Loading PDFs", unit="file"):
         loader = PyPDFLoader(str(pdf_file))
         pages = loader.load()
         
         # Chunk the documents
         chunks = text_splitter.split_documents(pages)
         all_documents.extend(chunks)
-        print(f"  → Created {len(chunks)} chunks")
     
-    print(f"\nTotal chunks: {len(all_documents)}")
+    print(f"\nTotal chunks created: {len(all_documents)}\n")
     return all_documents
 
 def scan_and_convert_pdfs():
@@ -99,25 +98,25 @@ def scan_and_convert_pdfs():
     if not documents:
         return
     
-    print("\nConverting documents to graph...")
-    print("This may take a few minutes depending on the number of chunks...\n")
+    print("Converting documents to graph...\n")
     
     # Process in batches to avoid overwhelming the API
-    batch_size = 5
+    batch_size = 10
     total_batches = (len(documents) + batch_size - 1) // batch_size
     
-    for i in range(0, len(documents), batch_size):
-        batch = documents[i:i+batch_size]
-        batch_num = (i // batch_size) + 1
-        
-        print(f"Processing batch {batch_num}/{total_batches} ({len(batch)} chunks)...")
-        
-        try:
-            graph_documents = transformer.convert_to_graph_documents(batch)
-            graph.add_graph_documents(graph_documents)
-            print(f"  ✓ Added {len(graph_documents)} graph documents to Neo4j")
-        except Exception as e:
-            print(f"  ✗ Error processing batch {batch_num}: {e}")
+    with tqdm(total=total_batches, desc="Processing batches", unit="batch") as pbar:
+        for i in range(0, len(documents), batch_size):
+            batch = documents[i:i+batch_size]
+            batch_num = (i // batch_size) + 1
+            
+            try:
+                graph_documents = transformer.convert_to_graph_documents(batch)
+                graph.add_graph_documents(graph_documents)
+                pbar.update(1)
+                pbar.set_postfix({"graphs_added": len(graph_documents)})
+            except Exception as e:
+                print(f"\n✗ Error processing batch {batch_num}: {e}")
+                pbar.update(1)
     
     print("\n✓ PDF scanning and conversion complete!")
     print_schema()
