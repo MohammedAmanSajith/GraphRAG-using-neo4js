@@ -7,3 +7,6 @@ neo4j
 python-dotenv
 pypdf
 tqdm
+langchain-core
+sentence-transformers
+langchain-huggingface
