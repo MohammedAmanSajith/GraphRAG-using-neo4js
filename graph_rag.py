@@ -186,7 +186,8 @@ def scan_and_convert_pdfs():
                     err = str(e)
                     if "429" in err or "RESOURCE_EXHAUSTED" in err or "quota" in err.lower() or "rate-limited" in err.lower() or "rate_limit" in err.lower():
                         delay = get_retry_delay(err)
-                        print(f"\n  \u26a0 Rate limited on batch {batch_num}, waiting {delay:.0f}s then retrying same model...")
+                        print(f"\n  \u26a0 Rate limited on batch {batch_num}, rotating model and waiting {delay:.0f}s...")
+                        rotate_model()
                         time.sleep(delay)
                     elif "404" in err or "NOT_FOUND" in err or "not found" in err.lower() or "not enabled" in err.lower() or "model_not_found" in err.lower() or "does not exist" in err.lower() or "402" in err or "json_schema" in err or "response_format" in err:
                         print(f"\n  \u26a0 Model unavailable, rotating...")
