@@ -3,10 +3,12 @@ langchain-google-genai
 langchain-neo4j
 langchain-experimental
 langchain-community
+langchain-core
+langchain-text-splitters
 neo4j
 python-dotenv
 pypdf
 tqdm
-langchain-core
+numpy
 sentence-transformers
-langchain-huggingface
+FlagEmbedding

@@ -43,7 +43,7 @@ def embed_query(text: str) -> list:
 # Each entry: (provider, model_name)
 AVAILABLE_MODELS = [
     ("groq",         "llama-3.3-70b-versatile"),
-    ("groq",         "llama3-70b-8192"),
+    ("groq",         "llama-3.1-8b-instant"),
     ("groq",         "llama3-8b-8192"),
     ("groq",         "gemma2-9b-it"),
     ("openrouter",   "meta-llama/llama-3.3-70b-instruct:free"),
@@ -166,38 +166,41 @@ def scan_and_convert_pdfs():
     print("Extracting entities & relationships via LLM...\n")
     batch_size = 1
     total_batches = len(documents)
-    max_retries = len(AVAILABLE_MODELS)
 
     with tqdm(total=total_batches, desc="Processing batches", unit="batch") as pbar:
         for i in range(0, len(documents), batch_size):
             batch = documents[i:i + batch_size]
             batch_num = (i // batch_size) + 1
-            success = False
 
-            for attempt in range(max_retries):
+            while True:
                 try:
                     graph_docs = transformer.convert_to_graph_documents(batch)
+                    # Store source chunk text on every node for richer context
+                    chunk_text = batch[0].page_content if batch else ""
+                    for doc in graph_docs:
+                        for node in doc.nodes:
+                            if not getattr(node, 'properties', None):
+                                node.properties = {}
+                            if not node.properties.get('description'):
+                                node.properties['description'] = chunk_text[:500]
                     graph.add_graph_documents(graph_docs, include_source=True)
-                    pbar.set_postfix({"model": AVAILABLE_MODELS[current_model_index]})
-                    success = True
+                    pbar.set_postfix({"model": AVAILABLE_MODELS[current_model_index][1]})
                     time.sleep(8)
                     break
                 except Exception as e:
                     err = str(e)
                     if "429" in err or "RESOURCE_EXHAUSTED" in err or "quota" in err.lower() or "rate-limited" in err.lower() or "rate_limit" in err.lower():
                         delay = get_retry_delay(err)
-                        print(f"\n  \u26a0 Rate limited on batch {batch_num}, rotating model and waiting {delay:.0f}s...")
+                        print(f"\n  \u26a0 Rate limited on batch {batch_num}, rotating and waiting {delay:.0f}s...")
                         rotate_model()
                         time.sleep(delay)
-                    elif "404" in err or "NOT_FOUND" in err or "not found" in err.lower() or "not enabled" in err.lower() or "model_not_found" in err.lower() or "does not exist" in err.lower() or "402" in err or "json_schema" in err or "response_format" in err:
-                        print(f"\n  \u26a0 Model unavailable, rotating...")
+                    elif "404" in err or "NOT_FOUND" in err or "not found" in err.lower() or "not enabled" in err.lower() or "model_not_found" in err.lower() or "does not exist" in err.lower() or "402" in err or "json_schema" in err or "response_format" in err or "decommissioned" in err.lower() or "model_decommissioned" in err.lower():
+                        print(f"\n  \u26a0 Model unavailable on batch {batch_num}, rotating...")
                         rotate_model()
                     else:
-                        print(f"\n  \u2717 Batch {batch_num} error: {e}")
-                        break
+                        print(f"\n  \u2717 Batch {batch_num} unexpected error: {e}")
+                        rotate_model()
 
-            if not success:
-                print(f"  \u2717 Skipping batch {batch_num} after {max_retries} attempts")
             pbar.update(1)
 
     print("\nGenerating BGE-M3 embeddings for semantic search...")
@@ -262,7 +265,7 @@ def graph_traversal(entity_ids: list, depth: int = 2) -> list:
     return graph.query(
         """
         UNWIND $ids AS seed
-        MATCH path = (start {id: seed})-[*1..$depth]->(end)
+        MATCH path = (start {id: seed})-[*1..2]->(end)
         UNWIND relationships(path) AS r
         RETURN DISTINCT
             startNode(r).id          AS from_node,
@@ -272,14 +275,14 @@ def graph_traversal(entity_ids: list, depth: int = 2) -> list:
             labels(endNode(r))[0]    AS to_type,
             endNode(r).description   AS to_desc
         """,
-        {"ids": entity_ids, "depth": depth}
+        {"ids": entity_ids}
     )
 
 # ── Full RAG Pipeline ─────────────────────────────────────────────────────────
 def rag_pipeline(question: str) -> str:
     # 1. BGE-M3 semantic search → seed entities
     print("  [1/3] BGE-M3 semantic search...")
-    seed_nodes = semantic_search(question, top_k=5)
+    seed_nodes = semantic_search(question, top_k=10)
     seed_ids = [n["id"] for n in seed_nodes]
     print(f"        Seeds: {seed_ids}")
 
@@ -296,8 +299,9 @@ def rag_pipeline(question: str) -> str:
         context_parts.append(line)
 
     for n in seed_nodes:
-        if n.get("desc"):
-            context_parts.append(f"{n['label']}:{n['id']} — {n['desc']}")
+        desc = n.get('desc') or ''
+        if desc:
+            context_parts.append(f"{n['label']}:{n['id']} — {desc}")
 
     context = "\n".join(context_parts) if context_parts else "No graph context found."
 
@@ -305,14 +309,16 @@ def rag_pipeline(question: str) -> str:
     print("  [3/3] LLM answer synthesis...")
     prompt = PromptTemplate(
         input_variables=["question", "context"],
-        template="""You are a knowledge graph assistant. Use the graph context to answer accurately.
+        template="""You are a knowledge graph assistant. Answer the question using the graph context below.
+The context contains entity relationships and source text from the document.
+Be specific and detailed. If the answer is directly in the source text, quote it.
 
 Graph Context:
 {context}
 
 Question: {question}
 
-Answer concisely based on the graph context. If insufficient, say so."""
+Answer based on the context above:"""
     )
 
     chain = prompt | llm
