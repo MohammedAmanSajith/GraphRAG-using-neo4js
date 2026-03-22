@@ -1,229 +1,172 @@
-# Graph RAG System with Neo4j and Google Gemini
+# Graph RAG System with Neo4j, Groq and BGE-M3
 
-A powerful Graph-based Retrieval Augmented Generation (RAG) system that converts PDF documents into knowledge graphs using Neo4j and Google Gemini LLM. Query your documents using natural language through an intelligent chatbot interface.
+A Graph-based Retrieval Augmented Generation (RAG) system that converts PDF documents into knowledge graphs using Neo4j, Groq LLM, and local BGE-M3 embeddings.
 
-## 🌟 Features
+## How It Works
 
-- **PDF to Knowledge Graph**: Automatically converts PDF documents into structured knowledge graphs
-- **Intelligent Chunking**: Smart text splitting with overlap for better context preservation
-- **Natural Language Queries**: Ask questions in plain English, automatically converted to Cypher queries
-- **Schema-Aware RAG**: Uses graph schema and few-shot learning for accurate query generation
-- **Interactive Chatbot**: Console-based interface for querying your document knowledge base
-- **Neo4j Integration**: Persistent storage in Neo4j graph database
+```
+PDF → Chunks → Groq LLM → Entities & Relationships → Neo4j Graph
+Question → BGE-M3 Embedding → Semantic Search → Graph Traversal → Groq LLM → Answer
+```
 
-## 📋 Prerequisites
+## Prerequisites
 
 - Python 3.8+
-- Neo4j Aura account (free tier available)
-- Google Gemini API key (free tier available)
+- Neo4j Aura account — https://console.neo4j.io (free tier)
+- Groq API key — https://console.groq.com (free tier)
+- OpenRouter API key — https://openrouter.ai (free tier, fallback)
+- Google Gemini API key — https://ai.google.dev (free tier, final fallback)
 
-## 🚀 Installation
+## Project Structure
 
-1. **Clone the repository**
-```bash
-git clone <your-repo-url>
-cd Graphrag
+```
+Graphrag/
+├── graph_rag.py       # Main application
+├── requirements.txt   # Python dependencies
+├── .env               # API keys and credentials (DO NOT COMMIT)
+├── .gitignore
+├── pdfs/              # Place your PDF files here
+└── README.md
 ```
 
-2. **Create virtual environment**
-```bash
+## Setup
+
+**Step 1 — Create and activate virtual environment**
+```
 python -m venv graph_venv
-source graph_venv/bin/activate  # On Windows: graph_venv\Scripts\activate
+graph_venv\Scripts\activate
 ```
 
-3. **Install dependencies**
-```bash
+**Step 2 — Install dependencies**
+```
 pip install -r requirements.txt
+pip install transformers==4.44.2
 ```
 
-4. **Set up environment variables**
+**Step 3 — Create your `.env` file**
 
-Create a `.env` file in the root directory:
-```env
+Create a file named `.env` in the project root:
+```
 NEO4J_URI=your_neo4j_uri
 NEO4J_USERNAME=your_username
 NEO4J_PASSWORD=your_password
 NEO4J_DATABASE=your_database
-GOOGLE_API_KEY=your_gemini_api_key
+GROQ_API_KEY=your_groq_api_key
+OPENROUTER_API_KEY=your_openrouter_api_key
+GOOGLE_API_KEY=your_google_api_key
 ```
 
-**How to get credentials:**
+Where to get credentials:
+- Neo4j: https://console.neo4j.io → Create free instance → copy URI, username, password, database
+- Groq: https://console.groq.com → API Keys → Create key
+- OpenRouter: https://openrouter.ai → Keys → Create key
+- Google Gemini: https://ai.google.dev → Get API key
 
-- **Neo4j Aura**: Sign up at https://console.neo4j.io
-  - Create a free instance
-  - Copy the connection URI, username, password, and database name
+**Step 4 — Add PDFs**
 
-- **Google Gemini API**: Get your key at https://ai.google.dev
-  - Create a new API key
-  - Free tier includes generous quotas
+Place your PDF files inside the `pdfs/` folder.
 
-## 📁 Project Structure
-
+**Step 5 — Run the application**
 ```
-Graphrag/
-├── graph_rag.py              # Main application (console mode)
-├── text_to_graph.ipynb       # Jupyter notebook for experimentation
-├── requirements.txt          # Python dependencies
-├── .env                      # Environment variables (DO NOT COMMIT)
-├── .gitignore               # Git ignore file
-├── pdfs/                    # Place your PDF files here
-└── README.md                # This file
-```
-
-## 🎯 Usage
-
-### Console Application
-
-Run the interactive console application:
-
-```bash
 python graph_rag.py --console
 ```
 
-**Main Menu Options:**
+## Usage
 
-1. **Scan PDFs folder and convert to Graph**
-   - Place PDF files in the `pdfs/` folder
-   - Select option 1 to process and upload to Neo4j
-   - Documents are chunked and converted to knowledge graphs
-
-2. **Chatbot - Query the Graph**
-   - Ask questions in natural language
-   - System generates Cypher queries automatically
-   - Get answers from your document knowledge base
-
-3. **Exit**
-   - Close the application
-
-### Jupyter Notebook
-
-For experimentation and testing:
-
-```bash
-jupyter notebook text_to_graph.ipynb
-```
-
-## 💡 Example Usage
-
-### Adding Documents
-
-1. Place PDF files in `pdfs/` folder
-2. Run: `python graph_rag.py --console`
-3. Select option 1
-4. Wait for processing to complete
-
-### Querying Documents
+### Build the Knowledge Graph
 
 ```
-You: Who is Marie Curie?
-Cypher: MATCH (p:Person {id: "Marie Curie"}) RETURN p
+1. Scan PDFs → Build Knowledge Graph
+```
+- Loads all PDFs from the `pdfs/` folder
+- Splits into chunks of 1000 characters
+- Extracts entities and relationships via Groq LLM
+- Stores graph in Neo4j
+- Generates BGE-M3 embeddings on all nodes
 
-You: What did she discover?
-Cypher: MATCH (p:Person {id: "Marie Curie"})-[r:DISCOVERED]->(e) RETURN e.id
+### Query the Graph
 
-You: Show me all organizations mentioned
-Cypher: MATCH (o:Organization) RETURN o.id
+```
+2. Chatbot → Query the Graph
+```
+- Type any question in natural language
+- BGE-M3 finds the most relevant nodes (semantic search)
+- Graph traversal expands context (depth 2)
+- Groq LLM synthesizes the final answer
+
+### Other Options
+
+```
+3. Show Schema        — view node types, relationship types, sample edges
+4. Delete All Data    — wipe Neo4j graph (use before re-scanning)
+5. Exit
 ```
 
-## 🔧 Configuration
+## Adding New PDFs or Updating Existing Ones
 
-### Chunking Parameters
+1. Activate the virtual environment
+2. Place new PDF files into the `pdfs/` folder
+3. Run `python graph_rag.py --console`
+4. Select option `4` to delete old graph data (if re-scanning everything) → type `yes`
+5. Select option `1` to scan and rebuild the graph
 
-Modify in `graph_rag.py`:
-```python
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1000,        # Adjust chunk size
-    chunk_overlap=200,      # Adjust overlap
-    length_function=len,
-    separators=["\n\n", "\n", " ", ""]
-)
+## Updating the Code
+
+1. Activate the virtual environment
+2. Pull latest changes — `git pull`
+3. Install any new dependencies — `pip install -r requirements.txt`
+4. Run `python graph_rag.py --console`
+
+## LLM Provider Chain
+
+The system tries providers in this order, rotating automatically on errors:
+
+| Priority | Provider   | Models                                                      |
+|----------|------------|-------------------------------------------------------------|
+| 1st      | Groq       | llama-3.3-70b-versatile, llama3-70b, llama3-8b, gemma2-9b  |
+| 2nd      | OpenRouter | llama-3.3-70b, mistral-small-3.1-24b, hermes-3-405b        |
+| 3rd      | Gemini     | gemini-2.0-flash-lite, gemini-2.0-flash, gemini-2.5-flash  |
+
+## Graph Schema
+
+Node types extracted: `Person`, `Organization`, `Location`, `Concept`, `Event`, `Product`, `Technology`, `Field`, `Award`, `Element`
+
+Relationship types: `WORKS_AT`, `FOUNDED`, `LOCATED_IN`, `PART_OF`, `RELATED_TO`, `DISCOVERED`, `INVENTED`, `WON`, `PARTICIPATED_IN`, `LEADS`, `COLLABORATED_WITH`, `STUDIED_AT`, `PUBLISHED`, `DEVELOPED`, `INFLUENCED`, `CAUSED`, `USES`, `BELONGS_TO`, `KNOWN_FOR`, `AFFILIATED_WITH`
+
+## Troubleshooting
+
+**BGE-M3 fails to load**
+```
+pip install transformers==4.44.2
 ```
 
-### Batch Processing
-
-Adjust batch size for API rate limits:
-```python
-batch_size = 5  # Process 5 chunks at a time
-```
-
-### Model Selection
-
-Change Gemini model:
-```python
-llm = ChatGoogleGenerativeAI(
-    model="gemini-flash-latest",  # or "gemini-2.0-flash"
-    google_api_key=os.getenv("GOOGLE_API_KEY"),
-    temperature=0
-)
-```
-
-## 🛡️ Security
-
-**IMPORTANT**: Never commit your `.env` file to GitHub!
-
-The `.gitignore` file is configured to exclude:
-- `.env` (credentials)
-- `__pycache__/` (Python cache)
-- `*.pyc` (compiled Python)
-- `.ipynb_checkpoints/` (Jupyter checkpoints)
-- `graph_venv/` (virtual environment)
-
-## 📊 Graph Schema
-
-The system automatically extracts:
-
-**Node Types:**
-- Person
-- Organization
-- Location
-- Concept
-- Award
-- Element
-- Field
-- (and more based on your documents)
-
-**Relationship Types:**
-- WORKED_AT
-- DISCOVERED
-- WON
-- LOCATED_IN
-- (and more based on document content)
-
-## 🐛 Troubleshooting
-
-### Neo4j Connection Issues
-- Verify your instance is running at https://console.neo4j.io
-- Check credentials in `.env` file
+**Neo4j connection error**
+- Check your instance is running at https://console.neo4j.io
+- Verify credentials in `.env`
 - Wait 60 seconds after creating a new instance
 
-### API Rate Limits
-- Free tier has rate limits
-- Reduce `batch_size` if hitting limits
-- Wait between requests if quota exceeded
+**All batches skipped / no nodes created**
+- Run option `4` to delete empty graph data, then re-scan
+- Check API keys in `.env` are valid
+- Groq free tier: 14,400 requests/day on llama-3.3-70b
 
-### PDF Processing Errors
-- Ensure PDFs are text-based (not scanned images)
-- Check PDF file permissions
-- Verify `pdfs/` folder exists
+**Rate limits**
+- The system waits and retries automatically on 429 errors
+- It rotates to the next provider on quota/credit errors
 
-## 🤝 Contributing
+## Security
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Never commit your `.env` file. The `.gitignore` excludes:
+- `.env`
+- `graph_venv/`
+- `__pycache__/`
+- `*.pyc`
+- `.ipynb_checkpoints/`
 
-## 📝 License
+## Dependencies
 
-This project is open source and available under the MIT License.
-
-## 🙏 Acknowledgments
-
-- [LangChain](https://langchain.com/) - LLM framework
-- [Neo4j](https://neo4j.com/) - Graph database
-- [Google Gemini](https://ai.google.dev/) - LLM API
-
-## 📧 Contact
-
-For questions or support, please open an issue on GitHub.
-
----
-
-**Note**: This is a demonstration project. For production use, implement proper error handling, logging, and security measures.
+- [LangChain](https://langchain.com/) — LLM orchestration
+- [Neo4j](https://neo4j.com/) — Graph database
+- [Groq](https://groq.com/) — Fast LLM inference
+- [BGE-M3](https://huggingface.co/BAAI/bge-m3) — Local embeddings (no API quota)
+- [FlagEmbedding](https://github.com/FlagOpen/FlagEmbedding) — BGE-M3 wrapper

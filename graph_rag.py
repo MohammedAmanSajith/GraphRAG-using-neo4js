@@ -3,20 +3,20 @@ import argparse
 import re
 import time
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_experimental.graph_transformers import LLMGraphTransformer
 from langchain_neo4j import Neo4jGraph
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import PromptTemplate
-from langchain_core.documents import Document
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
+from FlagEmbedding import BGEM3FlagModel
 
 load_dotenv()
 
-# ── Neo4j connection ──────────────────────────────────────────────────────────
+# ── Neo4j ─────────────────────────────────────────────────────────────────────
 graph = Neo4jGraph(
     url=os.getenv("NEO4J_URI"),
     username=os.getenv("NEO4J_USERNAME"),
@@ -24,56 +24,88 @@ graph = Neo4jGraph(
     database=os.getenv("NEO4J_DATABASE")
 )
 
-# ── LLM + Embeddings ──────────────────────────────────────────────────────────
-# Models ordered by preference; rotation happens on 429 RESOURCE_EXHAUSTED
+# ── BGE-M3 Embeddings (local, no API quota) ───────────────────────────────────
+print("Loading BGE-M3 embedding model...")
+bge_model = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True)
+print("✓ BGE-M3 loaded")
+
+def embed_texts(texts: list) -> list:
+    """Embed a list of texts using BGE-M3, returns list of vectors."""
+    result = bge_model.encode(texts, batch_size=12, max_length=512)
+    return result["dense_vecs"].tolist()
+
+def embed_query(text: str) -> list:
+    """Embed a single query using BGE-M3."""
+    result = bge_model.encode([text], batch_size=1, max_length=512)
+    return result["dense_vecs"][0].tolist()
+
+# ── LLM (Groq first, OpenRouter second, Gemini fallback) ─────────────────────
+# Each entry: (provider, model_name)
 AVAILABLE_MODELS = [
-    "gemini-2.0-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash",
-    "gemini-flash-latest",
-    "gemini-flash-lite-latest",
-    "gemini-pro-latest",
+    ("groq",         "llama-3.3-70b-versatile"),
+    ("groq",         "llama3-70b-8192"),
+    ("groq",         "llama3-8b-8192"),
+    ("groq",         "gemma2-9b-it"),
+    ("openrouter",   "meta-llama/llama-3.3-70b-instruct:free"),
+    ("openrouter",   "mistralai/mistral-small-3.1-24b-instruct:free"),
+    ("openrouter",   "nousresearch/hermes-3-llama-3.1-405b:free"),
+    ("gemini",       "gemini-2.0-flash-lite"),
+    ("gemini",       "gemini-2.0-flash"),
+    ("gemini",       "gemini-2.5-flash"),
 ]
 
 current_model_index = 0
 
-def get_llm(model_name=None):
-    if model_name is None:
-        model_name = AVAILABLE_MODELS[current_model_index]
-    return ChatGoogleGenerativeAI(
-        model=model_name,
-        google_api_key=os.getenv("GOOGLE_API_KEY"),
-        temperature=0
-    )
+def get_llm(index=None):
+    if index is None:
+        index = current_model_index
+    provider, model_name = AVAILABLE_MODELS[index]
+    if provider == "groq":
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=model_name,
+            openai_api_key=os.getenv("GROQ_API_KEY"),
+            openai_api_base="https://api.groq.com/openai/v1",
+            temperature=0
+        )
+    elif provider == "openrouter":
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=model_name,
+            openai_api_key=os.getenv("OPENROUTER_API_KEY"),
+            openai_api_base="https://openrouter.ai/api/v1",
+            temperature=0,
+            default_headers={
+                "HTTP-Referer": "https://github.com/graphrag",
+                "X-Title": "GraphRAG"
+            }
+        )
+    else:
+        return ChatGoogleGenerativeAI(
+            model=model_name,
+            google_api_key=os.getenv("GOOGLE_API_KEY"),
+            temperature=0
+        )
 
 def rotate_model():
-    """Switch to the next available model on quota exhaustion."""
     global current_model_index, llm, transformer
     current_model_index = (current_model_index + 1) % len(AVAILABLE_MODELS)
-    new_model = AVAILABLE_MODELS[current_model_index]
-    print(f"\n  \u21bb Switching to model: {new_model}")
-    llm = get_llm(new_model)
+    provider, model_name = AVAILABLE_MODELS[current_model_index]
+    print(f"\n  \u21bb Switching to [{provider}] {model_name}")
+    llm = get_llm(current_model_index)
     transformer = _build_transformer(llm)
-    return new_model
+    return model_name
 
-def get_retry_delay(err: str, default: float = 10.0) -> float:
-    """Extract retryDelay seconds from error message, fallback to default."""
-    match = re.search(r'retryDelay.*?(\d+)s', err)
-    if match:
-        return float(match.group(1))
-    match = re.search(r'retry in (\d+\.?\d*)s', err)
-    if match:
-        return float(match.group(1))
+def get_retry_delay(err: str, default: float = 15.0) -> float:
+    for pattern in [r"retryDelay.*?(\d+)s", r"retry in (\d+\.?\d*)s"]:
+        m = re.search(pattern, err)
+        if m:
+            return float(m.group(1))
     return default
 
-def get_embeddings():
-    return GoogleGenerativeAIEmbeddings(
-        model="models/gemini-embedding-001",
-        google_api_key=os.getenv("GOOGLE_API_KEY")
-    )
-
 def _build_transformer(llm_instance):
+    provider = AVAILABLE_MODELS[current_model_index][0]
+    use_prompt = provider == "groq"
     return LLMGraphTransformer(
         llm=llm_instance,
         allowed_nodes=[
@@ -86,16 +118,15 @@ def _build_transformer(llm_instance):
             "COLLABORATED_WITH", "STUDIED_AT", "PUBLISHED", "DEVELOPED",
             "INFLUENCED", "CAUSED", "USES", "BELONGS_TO", "KNOWN_FOR", "AFFILIATED_WITH"
         ],
-        node_properties=["description"],
+        node_properties=False if use_prompt else ["description"],
         relationship_properties=False,
-        strict_mode=False
+        strict_mode=False,
+        ignore_tool_usage=use_prompt
     )
 
-llm = get_llm()
-embeddings = get_embeddings()
-
-# ── LLMGraphTransformer: Directed, Unweighted, Cyclic, Multi-edge graph ───────
+llm = get_llm(0)
 transformer = _build_transformer(llm)
+print(f"✓ LLM ready: [{AVAILABLE_MODELS[0][0]}] {AVAILABLE_MODELS[0][1]}")
 
 PDF_FOLDER = "pdfs"
 
@@ -109,11 +140,9 @@ def load_and_chunk_pdfs():
     if not pdf_files:
         print(f"No PDF files found in {PDF_FOLDER}/")
         return []
-
     print(f"Found {len(pdf_files)} PDF file(s)\n")
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
+        chunk_size=1000, chunk_overlap=200,
         separators=["\n\n", "\n", " ", ""]
     )
     docs = []
@@ -123,7 +152,7 @@ def load_and_chunk_pdfs():
     print(f"\nTotal chunks: {len(docs)}\n")
     return docs
 
-# ── Step 1: LLM-Based Extraction → Knowledge Graph ───────────────────────────
+# ── Step 1: LLM Extraction → Knowledge Graph ─────────────────────────────────
 def scan_and_convert_pdfs():
     print("\n" + "="*50)
     print("STEP 1: LLM EXTRACTION → KNOWLEDGE GRAPH")
@@ -134,10 +163,9 @@ def scan_and_convert_pdfs():
     if not documents:
         return
 
-    # Store chunk text on nodes for semantic search later
     print("Extracting entities & relationships via LLM...\n")
-    batch_size = 5
-    total_batches = (len(documents) + batch_size - 1) // batch_size
+    batch_size = 1
+    total_batches = len(documents)
     max_retries = len(AVAILABLE_MODELS)
 
     with tqdm(total=total_batches, desc="Processing batches", unit="batch") as pbar:
@@ -152,86 +180,56 @@ def scan_and_convert_pdfs():
                     graph.add_graph_documents(graph_docs, include_source=True)
                     pbar.set_postfix({"model": AVAILABLE_MODELS[current_model_index]})
                     success = True
-                    time.sleep(3)
+                    time.sleep(8)
                     break
                 except Exception as e:
                     err = str(e)
-                    if "429" in err or "RESOURCE_EXHAUSTED" in err or "quota" in err.lower():
-                        delay = get_retry_delay(err, default=15.0)
-                        print(f"\n  ⚠ Quota on batch {batch_num}, switching model, waiting {delay:.0f}s...")
-                        rotate_model()
+                    if "429" in err or "RESOURCE_EXHAUSTED" in err or "quota" in err.lower() or "rate-limited" in err.lower() or "rate_limit" in err.lower():
+                        delay = get_retry_delay(err)
+                        print(f"\n  \u26a0 Rate limited on batch {batch_num}, waiting {delay:.0f}s then retrying same model...")
                         time.sleep(delay)
-                    elif "404" in err or "NOT_FOUND" in err:
-                        print(f"\n  ⚠ Model not found, rotating...")
+                    elif "404" in err or "NOT_FOUND" in err or "not found" in err.lower() or "not enabled" in err.lower() or "model_not_found" in err.lower() or "does not exist" in err.lower() or "402" in err or "json_schema" in err or "response_format" in err:
+                        print(f"\n  \u26a0 Model unavailable, rotating...")
                         rotate_model()
                     else:
-                        print(f"\n  ✗ Batch {batch_num} error: {e}")
+                        print(f"\n  \u2717 Batch {batch_num} error: {e}")
                         break
 
             if not success:
-                print(f"  ✗ Skipping batch {batch_num} after {max_retries} attempts")
+                print(f"  \u2717 Skipping batch {batch_num} after {max_retries} attempts")
             pbar.update(1)
 
-    # Store embeddings on each node for semantic search
-    print("\nGenerating embeddings for semantic search...")
+    print("\nGenerating BGE-M3 embeddings for semantic search...")
     _store_node_embeddings()
-
     print("\n✓ Knowledge graph built successfully!")
     print_schema()
 
+# ── Step 2: Store BGE-M3 Embeddings on Nodes ─────────────────────────────────
 def _store_node_embeddings():
-    """Embed each node's id+description and store as property in Neo4j."""
-    nodes = graph.query("MATCH (n) WHERE n.id IS NOT NULL RETURN n.id AS id, labels(n)[0] AS label, n.description AS desc")
+    nodes = graph.query(
+        "MATCH (n) WHERE n.id IS NOT NULL "
+        "RETURN n.id AS id, labels(n)[0] AS label, n.description AS desc"
+    )
     if not nodes:
+        print("  No nodes found to embed.")
         return
 
     texts = [f"{n['label']}: {n['id']}. {n['desc'] or ''}" for n in nodes]
     try:
-        vecs = embeddings.embed_documents(texts)
+        vecs = embed_texts(texts)
         for node, vec in zip(nodes, vecs):
             graph.query(
                 "MATCH (n {id: $id}) SET n.embedding = $embedding",
                 {"id": node["id"], "embedding": vec}
             )
-        print(f"  ✓ Stored embeddings for {len(nodes)} nodes")
+        print(f"  ✓ BGE-M3 embeddings stored for {len(nodes)} nodes")
     except Exception as e:
-        print(f"  ✗ Embedding storage error: {e}")
+        print(f"  \u2717 Embedding error: {e}")
 
-# ── Step 2: Graph Traversal ───────────────────────────────────────────────────
-def graph_traversal(entity_ids: list, depth: int = 2) -> list:
-    """
-    Navigate the directed knowledge graph from seed entities.
-    Follows directed edges up to `depth` hops, collecting all
-    connected nodes and relationships (supports cycles & multi-edges).
-    """
-    if not entity_ids:
-        return []
-
-    results = graph.query(
-        """
-        UNWIND $ids AS seed
-        MATCH path = (start {id: seed})-[*1..$depth]->(end)
-        UNWIND relationships(path) AS r
-        RETURN
-            startNode(r).id   AS from_node,
-            labels(startNode(r))[0] AS from_type,
-            type(r)           AS relationship,
-            endNode(r).id     AS to_node,
-            labels(endNode(r))[0] AS to_type,
-            endNode(r).description AS to_desc
-        """,
-        {"ids": entity_ids, "depth": depth}
-    )
-    return results
-
-# ── Step 3: Semantic Search via Embeddings ────────────────────────────────────
+# ── Step 3: Semantic Search (BGE-M3 cosine similarity) ───────────────────────
 def semantic_search(question: str, top_k: int = 5) -> list:
-    """
-    Embed the question and find the most similar nodes using
-    cosine similarity against stored node embeddings.
-    """
     try:
-        q_vec = embeddings.embed_query(question)
+        q_vec = np.array(embed_query(question))
         nodes = graph.query(
             "MATCH (n) WHERE n.embedding IS NOT NULL AND n.id IS NOT NULL "
             "RETURN n.id AS id, labels(n)[0] AS label, n.description AS desc, n.embedding AS embedding"
@@ -239,74 +237,84 @@ def semantic_search(question: str, top_k: int = 5) -> list:
         if not nodes:
             return []
 
-        q_arr = np.array(q_vec)
         scored = []
         for node in nodes:
-            n_arr = np.array(node["embedding"])
-            # cosine similarity
-            sim = float(np.dot(q_arr, n_arr) / (np.linalg.norm(q_arr) * np.linalg.norm(n_arr) + 1e-9))
+            n_vec = np.array(node["embedding"])
+            sim = float(np.dot(q_vec, n_vec) / (np.linalg.norm(q_vec) * np.linalg.norm(n_vec) + 1e-9))
             scored.append((sim, node))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         return [n for _, n in scored[:top_k]]
 
     except Exception as e:
-        print(f"  ✗ Semantic search error: {e}")
-        # Fallback: return top nodes by label
+        print(f"  \u2717 Semantic search error: {e}")
         return graph.query(
-            "MATCH (n) WHERE n.id IS NOT NULL RETURN n.id AS id, labels(n)[0] AS label, n.description AS desc LIMIT $k",
+            "MATCH (n) WHERE n.id IS NOT NULL "
+            "RETURN n.id AS id, labels(n)[0] AS label, n.description AS desc LIMIT $k",
             {"k": top_k}
         )
 
+# ── Step 4: Graph Traversal ───────────────────────────────────────────────────
+def graph_traversal(entity_ids: list, depth: int = 2) -> list:
+    if not entity_ids:
+        return []
+    return graph.query(
+        """
+        UNWIND $ids AS seed
+        MATCH path = (start {id: seed})-[*1..$depth]->(end)
+        UNWIND relationships(path) AS r
+        RETURN DISTINCT
+            startNode(r).id          AS from_node,
+            labels(startNode(r))[0]  AS from_type,
+            type(r)                  AS relationship,
+            endNode(r).id            AS to_node,
+            labels(endNode(r))[0]    AS to_type,
+            endNode(r).description   AS to_desc
+        """,
+        {"ids": entity_ids, "depth": depth}
+    )
+
 # ── Full RAG Pipeline ─────────────────────────────────────────────────────────
 def rag_pipeline(question: str) -> str:
-    """
-    Full Graph RAG:
-    1. Semantic search  → find relevant seed entities
-    2. Graph traversal  → navigate connected entities (directed, multi-edge, cyclic)
-    3. LLM synthesis    → generate answer from retrieved context
-    """
-    # Step 1: Semantic search for seed entities
-    print("  [1/3] Semantic search for relevant entities...")
+    # 1. BGE-M3 semantic search → seed entities
+    print("  [1/3] BGE-M3 semantic search...")
     seed_nodes = semantic_search(question, top_k=5)
     seed_ids = [n["id"] for n in seed_nodes]
     print(f"        Seeds: {seed_ids}")
 
-    # Step 2: Graph traversal from seeds
+    # 2. Graph traversal from seeds
     print("  [2/3] Graph traversal (directed, multi-edge, cyclic)...")
-    traversal_results = graph_traversal(seed_ids, depth=2)
+    traversal = graph_traversal(seed_ids, depth=2)
 
-    # Build context from traversal
     context_parts = []
-    for r in traversal_results:
-        context_parts.append(
-            f"({r['from_type']}:{r['from_node']}) -[{r['relationship']}]-> "
-            f"({r['to_type']}:{r['to_node']})"
-            + (f" | {r['to_desc']}" if r.get('to_desc') else "")
-        )
+    for r in traversal:
+        line = (f"({r['from_type']}:{r['from_node']}) -[{r['relationship']}]-> "
+                f"({r['to_type']}:{r['to_node']})")
+        if r.get("to_desc"):
+            line += f" | {r['to_desc']}"
+        context_parts.append(line)
 
-    # Also include seed node descriptions
     for n in seed_nodes:
         if n.get("desc"):
             context_parts.append(f"{n['label']}:{n['id']} — {n['desc']}")
 
     context = "\n".join(context_parts) if context_parts else "No graph context found."
 
-    # Step 3: LLM answer synthesis
+    # 3. LLM answer synthesis
     print("  [3/3] LLM answer synthesis...")
-    answer_prompt = PromptTemplate(
+    prompt = PromptTemplate(
         input_variables=["question", "context"],
-        template="""You are a knowledge graph assistant. Use the graph context below to answer the question accurately.
+        template="""You are a knowledge graph assistant. Use the graph context to answer accurately.
 
-Graph Context (entities and relationships):
+Graph Context:
 {context}
 
 Question: {question}
 
-Provide a clear, concise answer based on the graph context. If the context doesn't contain enough information, say so."""
+Answer concisely based on the graph context. If insufficient, say so."""
     )
 
-    chain = answer_prompt | llm
+    chain = prompt | llm
     for attempt in range(len(AVAILABLE_MODELS)):
         try:
             response = chain.invoke({"question": question, "context": context})
@@ -314,19 +322,19 @@ Provide a clear, concise answer based on the graph context. If the context doesn
         except Exception as e:
             if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e) or "404" in str(e) or "NOT_FOUND" in str(e):
                 rotate_model()
-                chain = answer_prompt | llm
+                chain = prompt | llm
             else:
                 raise
 
     if hasattr(response, "content"):
         content = response.content
-        if isinstance(content, list) and len(content) > 0:
+        if isinstance(content, list) and content:
             item = content[0]
             return item["text"] if isinstance(item, dict) and "text" in item else str(item)
         return str(content)
     return str(response)
 
-# ── Schema Display ────────────────────────────────────────────────────────────
+# ── Schema ────────────────────────────────────────────────────────────────────
 def print_schema():
     print("\n" + "="*50)
     print("KNOWLEDGE GRAPH SCHEMA")
@@ -365,12 +373,10 @@ def get_schema_summary():
 def chatbot():
     print("\n" + "="*50)
     print("GRAPH RAG CHATBOT")
-    print("Pipeline: Semantic Search → Graph Traversal → LLM Answer")
+    print("BGE-M3 Semantic Search → Graph Traversal → LLM Answer")
     print("="*50)
     print("Type 'exit' or 'quit' to return to main menu\n")
-
-    schema = get_schema_summary()
-    print(f"Graph loaded:\n{schema}\n")
+    print(f"Graph loaded:\n{get_schema_summary()}\n")
     print("="*50 + "\n")
 
     while True:
@@ -379,20 +385,19 @@ def chatbot():
             break
         if not question:
             continue
-
         print()
         try:
             answer = rag_pipeline(question)
             print(f"\nAssistant: {answer}")
         except Exception as e:
-            print(f"\n✗ Error: {e}")
+            print(f"\n\u2717 Error: {e}")
 
-# ── Delete Graph Data ────────────────────────────────────────────────────────
+# ── Delete Graph Data ─────────────────────────────────────────────────────────
 def delete_graph_data():
     print("\n" + "="*50)
     print("DELETE ALL GRAPH DATA")
     print("="*50)
-    confirm = input("\n⚠ This will delete ALL nodes, relationships and embeddings.\nType 'yes' to confirm: ").strip().lower()
+    confirm = input("\n\u26a0 This will delete ALL nodes, relationships and embeddings.\nType 'yes' to confirm: ").strip().lower()
     if confirm != "yes":
         print("Cancelled.")
         return
@@ -400,15 +405,15 @@ def delete_graph_data():
         graph.query("MATCH (n) DETACH DELETE n")
         print("✓ All graph data deleted. You can now re-scan your PDFs.")
     except Exception as e:
-        print(f"✗ Error deleting data: {e}")
+        print(f"\u2717 Error: {e}")
 
 # ── Main Menu ─────────────────────────────────────────────────────────────────
 def main_menu():
     create_pdf_folder()
-
     while True:
         print("\n" + "="*50)
         print("GRAPH RAG SYSTEM")
+        print("LLM: Groq → OpenRouter → Gemini | Storage: Neo4j | Embeddings: BGE-M3")
         print("="*50)
         print("\n1. Scan PDFs → Build Knowledge Graph")
         print("2. Chatbot   → Query the Graph")
@@ -417,7 +422,6 @@ def main_menu():
         print("5. Exit")
 
         choice = input("\nEnter your choice (1-5): ").strip()
-
         if choice == "1":
             scan_and_convert_pdfs()
         elif choice == "2":
@@ -430,13 +434,12 @@ def main_menu():
             print("\nGoodbye!")
             break
         else:
-            print("\n✗ Invalid choice.")
+            print("\n\u2717 Invalid choice.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Graph RAG System")
     parser.add_argument("--console", action="store_true", help="Run in console mode")
     args = parser.parse_args()
-
     if args.console:
         main_menu()
     else:
