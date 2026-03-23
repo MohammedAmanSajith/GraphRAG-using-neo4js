@@ -43,9 +43,9 @@ def embed_query(text: str) -> list:
 # Each entry: (provider, model_name)
 AVAILABLE_MODELS = [
     ("groq",         "llama-3.3-70b-versatile"),
+    ("groq",         "meta-llama/llama-4-scout-17b-16e-instruct"),
+    ("groq",         "moonshotai/kimi-k2-instruct"),
     ("groq",         "llama-3.1-8b-instant"),
-    ("groq",         "llama3-8b-8192"),
-    ("groq",         "gemma2-9b-it"),
     ("openrouter",   "meta-llama/llama-3.3-70b-instruct:free"),
     ("openrouter",   "mistralai/mistral-small-3.1-24b-instruct:free"),
     ("openrouter",   "nousresearch/hermes-3-llama-3.1-405b:free"),
@@ -323,7 +323,8 @@ def rag_pipeline(question: str) -> str:
         if desc:
             context_parts.append(f"{n['label']}:{n['id']} — {desc}")
 
-    context = "\n".join(context_parts) if context_parts else "No graph context found."
+    context = "\n".join(context_parts[:50]) if context_parts else "No graph context found."
+    context = context[:6000]  # hard cap to avoid 413 on smaller models
 
     # 3. LLM answer synthesis
     print("  [3/3] LLM answer synthesis...")
@@ -347,7 +348,7 @@ Answer based on the context above:"""
             response = chain.invoke({"question": question, "context": context})
             break
         except Exception as e:
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e) or "404" in str(e) or "NOT_FOUND" in str(e):
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e) or "404" in str(e) or "NOT_FOUND" in str(e) or "413" in str(e) or "too large" in str(e).lower():
                 rotate_model()
                 chain = prompt | llm
             else:
