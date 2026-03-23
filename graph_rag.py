@@ -128,6 +128,26 @@ llm = get_llm(0)
 transformer = _build_transformer(llm)
 print(f"✓ LLM ready: [{AVAILABLE_MODELS[0][0]}] {AVAILABLE_MODELS[0][1]}")
 
+def print_graph_status():
+    try:
+        node_count = graph.query("MATCH (n) WHERE n.id IS NOT NULL RETURN count(n) AS count")[0]["count"]
+        rel_count = graph.query("MATCH ()-[r]->() RETURN count(r) AS count")[0]["count"]
+        embedded = graph.query("MATCH (n) WHERE n.embedding IS NOT NULL RETURN count(n) AS count")[0]["count"]
+        node_types = graph.query("MATCH (n) WHERE n.id IS NOT NULL RETURN DISTINCT labels(n)[0] AS label, count(n) AS cnt ORDER BY cnt DESC")
+        print("\n── Graph Status ──────────────────────────")
+        print(f"  Nodes    : {node_count}")
+        print(f"  Edges    : {rel_count}")
+        print(f"  Embedded : {embedded}/{node_count} nodes have BGE-M3 vectors")
+        print(f"  Types    :")
+        for n in node_types:
+            if n["label"]:
+                print(f"    - {n['label']}: {n['cnt']}")
+        print("──────────────────────────────────────────\n")
+    except Exception as e:
+        print(f"  Graph status unavailable: {e}\n")
+
+print_graph_status()
+
 PDF_FOLDER = "pdfs"
 
 # ── PDF Loading & Chunking ────────────────────────────────────────────────────
